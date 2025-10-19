@@ -1,0 +1,29 @@
+{
+    "training_data": {
+      "scannet": {
+        "scenes": 7,
+        "images": 894,
+        "questions": 0
+      },
+      "3d_front": {
+        "scenes": 5,
+        "images": 25,
+        "questions": 10
+      },
+      "total": {
+        "scenes": 12,
+        "images": 919,
+        "questions": 10
+      }
+    },
+    "datasets": [
+      "scannet",
+      "3d_front",
+      "total"
+    ],
+    "total_scenes": 12,
+    "total_images": 919,
+    "total_questions": 10,
+    "created": "2024",
+    "purpose": "Distilled LLaVA-3D training"
+}
