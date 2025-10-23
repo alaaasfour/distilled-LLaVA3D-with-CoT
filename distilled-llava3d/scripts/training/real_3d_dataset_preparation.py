@@ -6,9 +6,6 @@ Real 3D Dataset Preparation for Distilled LLaVA-3D Training
 This module downloads, processes, and prepares real 3D datasets for training
 the distilled LLaVA-3D model. It supports ScanNet, 3D-FRONT, and other
 standard 3D VLM datasets.
-
-Author: Alaa Asfour
-Date: 2024
 """
 
 import os
