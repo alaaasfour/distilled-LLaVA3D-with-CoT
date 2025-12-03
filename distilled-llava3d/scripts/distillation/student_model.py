@@ -3,8 +3,52 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Tuple, Union
 import math
+import warnings
+import os
+
+# Try to import VGGT
+try:
+    # Try importing from transformers (if available)
+    from transformers import AutoModel, AutoImageProcessor
+    VGGT_AVAILABLE = True
+except ImportError:
+    VGGT_AVAILABLE = False
+    warnings.warn("transformers not available, VGGT integration may not work")
+
+# Initialize VGGT_CLASS_AVAILABLE and try to import VGGT
+VGGT_CLASS_AVAILABLE = False
+VGGT_CLASS = None
+
+# Try alternative imports for VGGT
+try:
+    import sys
+    import os
+    # Common paths where VGGT might be installed
+    possible_paths = [
+        '/home/alasfour/scratch/vggt',
+        '/home/alasfour/scratch/vgg-t',
+        os.path.expanduser('~/vggt'),
+        os.path.expanduser('~/vgg-t'),
+    ]
+    for path in possible_paths:
+        if os.path.exists(path):
+            if path not in sys.path:
+                sys.path.insert(0, path)
+            break
+    
+    # Try to import VGGT directly
+    try:
+        from vggt.models.vggt import VGGT as VGGT_CLASS
+        VGGT_CLASS_AVAILABLE = True
+    except ImportError as e:
+        VGGT_CLASS_AVAILABLE = False
+        VGGT_CLASS = None
+except Exception as e:
+    VGGT_CLASS_AVAILABLE = False
+    VGGT_CLASS = None
 
 class DistilledLLaVA3DConfig:
     """Configuration for distilled LLaVA-3D model."""
@@ -31,9 +75,370 @@ class DistilledLLaVA3DConfig:
         # Training config
         self.dropout_prob = 0.1
         self.layer_norm_eps = 1e-6
+        
+        # VGGT device config (can be 'cpu' or 'cuda')
+        self.vggt_device = 'cpu'  # Default to CPU, can be changed
+
+class VGGTVisionEncoder(nn.Module):
+    """
+    VGGT (Visual Geometry Grounded Transformer) Vision Encoder
+    
+    VGGT is a feed-forward neural network that directly infers key 3D attributes
+    including camera parameters, point maps, depth maps, and 3D point tracks.
+    Reference: https://vgg-t.github.io/
+    """
+    
+    def __init__(self, config, vggt_model_path=None, use_pretrained=True, vggt_device='cpu'):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.vision_hidden_size
+        self.vggt_model_path = vggt_model_path
+        self.use_pretrained = use_pretrained
+        self.vggt_device = vggt_device  # 'cpu' or 'cuda' - use CPU to save GPU memory
+        
+        # Try to load VGGT model
+        self.vggt_model = None
+        self.vggt_processor = None
+        self._load_vggt()
+        
+        # Register hook to keep VGGT on CPU when parent model is moved
+        if self.vggt_model is not None and self.vggt_device == 'cpu':
+            self._register_vggt_cpu_hook()
+        
+        # Projection layer to map VGGT features to desired hidden size
+        # VGGT's aggregator outputs features of size 2 * embed_dim = 2 * 1024 = 2048
+        vggt_feature_size = 2048  # VGGT uses 2 * embed_dim for aggregated tokens
+        if self.vggt_model is not None:
+            # Try to infer feature size from model's aggregator
+            try:
+                if hasattr(self.vggt_model, 'aggregator'):
+                    aggregator = self.vggt_model.aggregator
+                    if hasattr(aggregator, 'embed_dim'):
+                        # VGGT outputs 2 * embed_dim (frame + camera tokens combined)
+                        vggt_feature_size = 2 * aggregator.embed_dim
+                    elif hasattr(aggregator, 'dim'):
+                        vggt_feature_size = 2 * aggregator.dim
+            except:
+                pass
+        
+        # Create projection layer - will be recreated if needed after VGGT loads
+        self.feature_projection = nn.Linear(vggt_feature_size, self.hidden_size)
+        
+        # If VGGT loaded successfully, ensure projection matches actual feature size
+        if self.vggt_model is not None:
+            # Recreate projection with correct size if needed
+            actual_feature_size = vggt_feature_size
+            if self.feature_projection.in_features != actual_feature_size:
+                self.feature_projection = nn.Linear(actual_feature_size, self.hidden_size)
+        
+        # Fallback CNN if VGGT is not available
+        if self.vggt_model is None:
+            warnings.warn("VGGT model not available, using fallback CNN encoder")
+            self.fallback_encoder = nn.Sequential(
+                nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
+                nn.ReLU(),
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool2d((7, 7))
+            )
+            self.fallback_projection = nn.Linear(512 * 7 * 7, self.hidden_size)
+        else:
+            self.fallback_encoder = None
+            self.fallback_projection = None
+    
+    def _load_vggt(self):
+        """Load VGGT model from various possible sources."""
+        # First try to load from local cloned repository
+        if VGGT_CLASS_AVAILABLE:
+            try:
+                # Try loading pretrained model from HuggingFace
+                if VGGT_CLASS is not None:
+                    model_names = [
+                        'facebook/VGGT-1B',
+                        'facebook/VGGT-1B-Commercial',
+                    ]
+                    
+                    if self.vggt_model_path:
+                        model_names.insert(0, self.vggt_model_path)
+                    
+                    for model_name in model_names:
+                        try:
+                            # Load VGGT on CPU from the start to avoid GPU memory issues
+                            import torch
+                            original_device = torch.cuda.current_device() if torch.cuda.is_available() else None
+                            # Temporarily disable CUDA to force CPU loading
+                            if self.vggt_device == 'cpu':
+                                # Force CPU device for loading
+                                with torch.cuda.device(-1):  # Use CPU
+                                    self.vggt_model = VGGT_CLASS.from_pretrained(model_name, device_map='cpu')
+                            else:
+                                self.vggt_model = VGGT_CLASS.from_pretrained(model_name)
+                            
+                            print(f"✅ Loaded VGGT model: {model_name}")
+                            self.vggt_model.eval()  # Set to evaluation mode
+                            # Freeze VGGT parameters to save memory and prevent gradient computation
+                            for param in self.vggt_model.parameters():
+                                param.requires_grad = False
+                            # Explicitly move VGGT to CPU to save GPU memory (CPU offloading)
+                            self.vggt_model.to(self.vggt_device)
+                            # Ensure all parameters are on CPU
+                            for param in self.vggt_model.parameters():
+                                if param.device.type != 'cpu' and self.vggt_device == 'cpu':
+                                    param.data = param.data.cpu()
+                            print(f"✅ VGGT parameters frozen and moved to {self.vggt_device} (memory optimized)")
+                            return
+                        except Exception as e:
+                            # Try next model name
+                            continue
+                    
+                    # If pretrained loading fails, try creating model without weights
+                    try:
+                        self.vggt_model = VGGT_CLASS(
+                            img_size=518,
+                            patch_size=14,
+                            embed_dim=1024,
+                            enable_camera=False,  # We only need features, not camera
+                            enable_point=False,   # We only need features
+                            enable_depth=True,    # Keep depth for potential use
+                            enable_track=False   # We only need features
+                        )
+                        print("✅ Created VGGT model (without pretrained weights)")
+                        self.vggt_model.eval()
+                        # Freeze VGGT parameters to save memory
+                        for param in self.vggt_model.parameters():
+                            param.requires_grad = False
+                        # Move VGGT to CPU to save GPU memory
+                        self.vggt_model.to(self.vggt_device)
+                        return
+                    except Exception as e:
+                        print(f"⚠️  Could not create VGGT model: {e}")
+            except Exception as e:
+                print(f"⚠️  Error loading VGGT: {e}")
+        
+        # Fallback: Try loading from HuggingFace via transformers
+        if VGGT_AVAILABLE:
+            try:
+                model_names = [
+                    'facebook/vggt-base',
+                    'facebook/vggt-large',
+                ]
+                for model_name in model_names:
+                    try:
+                        self.vggt_model = AutoModel.from_pretrained(
+                            model_name,
+                            trust_remote_code=True
+                        )
+                        print(f"✅ Loaded VGGT via transformers: {model_name}")
+                        return
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        
+        print("⚠️  VGGT model not found, will use fallback CNN encoder")
+    
+    def _register_vggt_cpu_hook(self):
+        """Register a hook to keep VGGT on CPU even when parent model is moved."""
+        def keep_vggt_on_cpu(module, input):
+            if self.vggt_model is not None:
+                # Ensure VGGT stays on CPU
+                current_device = next(self.vggt_model.parameters()).device
+                if current_device.type != 'cpu':
+                    self.vggt_model.to('cpu')
+        
+        # Register forward hook
+        self.register_forward_pre_hook(keep_vggt_on_cpu)
+    
+    def _apply(self, fn):
+        """Override _apply to keep VGGT on CPU."""
+        # Store VGGT device preference before applying
+        vggt_should_be_cpu = (self.vggt_model is not None and self.vggt_device == 'cpu')
+        
+        # Apply function to all child modules (this will move them to device)
+        for module in self.children():
+            module._apply(fn)
+        
+        # Apply to self parameters and buffers
+        for key, param in self._parameters.items():
+            if param is not None:
+                self._parameters[key] = fn(param)
+        for key, buf in self._buffers.items():
+            if buf is not None:
+                self._buffers[key] = fn(buf)
+        
+        # Explicitly move VGGT back to CPU if it should be on CPU
+        if vggt_should_be_cpu and self.vggt_model is not None:
+            # Force VGGT to CPU
+            self.vggt_model.to('cpu')
+            # Also ensure all VGGT parameters are on CPU
+            for param in self.vggt_model.parameters():
+                if param.device.type != 'cpu':
+                    param.data = param.data.cpu()
+        
+        return self
+    
+    def _extract_vggt_features(self, pixel_values):
+        """Extract features from VGGT model."""
+        if self.vggt_model is None:
+            return None
+        
+        try:
+            # Store original device
+            original_device = pixel_values.device
+            
+            # VGGT expects images in range [0, 1] and shape [B, S, 3, H, W] or [S, 3, H, W]
+            # Normalize if needed
+            if pixel_values.max() > 1.0:
+                pixel_values = pixel_values / 255.0
+            
+            # Handle input shape: VGGT expects [B, S, 3, H, W] or [S, 3, H, W]
+            original_shape = pixel_values.shape
+            if len(original_shape) == 4:  # [B, 3, H, W]
+                # Add sequence dimension: [B, 1, 3, H, W]
+                pixel_values = pixel_values.unsqueeze(1)
+            elif len(original_shape) == 5:  # [B, S, 3, H, W] - already correct
+                pass
+            else:
+                return None
+            
+            # VGGT requires images to be resized to img_size (default 518) or multiples of patch_size (14)
+            # Get VGGT's expected image size
+            vggt_img_size = 518  # Default VGGT image size
+            if hasattr(self.vggt_model, 'aggregator') and hasattr(self.vggt_model.aggregator, 'img_size'):
+                vggt_img_size = self.vggt_model.aggregator.img_size
+            
+            # Resize images to VGGT's expected size if needed
+            batch_size, seq_len, channels, height, width = pixel_values.shape
+            if height != vggt_img_size or width != vggt_img_size:
+                # Resize to VGGT's expected size using interpolation
+                pixel_values = F.interpolate(
+                    pixel_values.view(batch_size * seq_len, channels, height, width),
+                    size=(vggt_img_size, vggt_img_size),
+                    mode='bilinear',
+                    align_corners=False
+                ).view(batch_size, seq_len, channels, vggt_img_size, vggt_img_size)
+            
+            # Move input to VGGT's device (CPU if using CPU offloading) and ensure float32
+            pixel_values = pixel_values.to(self.vggt_device).float()
+            
+            # VGGT forward pass - use no_grad since VGGT is frozen
+            # This saves significant memory
+            with torch.no_grad():
+                # Access the aggregator to get features
+                if hasattr(self.vggt_model, 'aggregator'):
+                    # Get aggregated tokens from VGGT's aggregator
+                    aggregated_tokens_list, patch_start_idx = self.vggt_model.aggregator(pixel_values)
+                    
+                    # Use the last iteration's tokens (most refined)
+                    if aggregated_tokens_list and len(aggregated_tokens_list) > 0:
+                        tokens = aggregated_tokens_list[-1]  # [B, S, N, D] or [B, N, D]
+                        
+                        # Extract frame tokens (remove camera tokens if present)
+                        # VGGT uses frame-wise tokens, we want to aggregate them
+                        if len(tokens.shape) == 4:  # [B, S, N, D]
+                            # Average over sequence and patches: [B, S, N, D] -> [B, D]
+                            features = tokens.mean(dim=(1, 2))  # Average over S and N
+                        elif len(tokens.shape) == 3:  # [B, N, D]
+                            # Average over patches: [B, N, D] -> [B, D]
+                            features = tokens.mean(dim=1)
+                        else:
+                            # Fallback: try to get a global feature
+                            features = tokens.view(tokens.shape[0], -1).mean(dim=1, keepdim=True)
+                            if features.shape[1] != tokens.shape[-1]:
+                                features = tokens.mean(dim=tuple(range(1, len(tokens.shape))))
+                        
+                        # Move features back to original device (GPU) and ensure float32
+                        features = features.to(original_device).float()
+                        return features
+                    else:
+                        return None
+                else:
+                    # Fallback: try standard forward and extract from outputs
+                    outputs = self.vggt_model(pixel_values)
+                    
+                    if isinstance(outputs, dict):
+                        # Try to extract features from aggregator tokens if available
+                        # Or use depth/world_points features
+                        if 'world_points' in outputs:
+                            # Use world points as features (flatten spatial dimensions)
+                            world_pts = outputs['world_points']  # [B, S, H, W, 3]
+                            features = world_pts.view(world_pts.shape[0], -1).mean(dim=1)  # [B, 3] -> project to hidden_size
+                            # Move features back to original device (GPU) and ensure float32
+                            features = features.to(original_device).float()
+                        else:
+                            return None
+                    else:
+                        return None
+                        
+        except Exception as e:
+            warnings.warn(f"Error extracting VGGT features: {e}, using fallback")
+            import traceback
+            traceback.print_exc()
+            return None
+        
+        return None
+    
+    def forward(self, pixel_values):
+        """
+        Forward pass through VGGT vision encoder.
+        
+        Args:
+            pixel_values: Input images
+                - 4D: (batch, channels, height, width)
+                - 5D: (batch, views, channels, height, width)
+        
+        Returns:
+            MockOutput with last_hidden_state of shape (batch, 1, hidden_size)
+        """
+        batch_size = pixel_values.size(0)
+        
+        # Handle different input shapes
+        is_multi_view = len(pixel_values.shape) == 5
+        if is_multi_view:
+            # For multi-view, process first view or average across views
+            # VGGT can handle multiple views, but for now use first view
+            pixel_values = pixel_values[:, 0]  # (batch, channels, height, width)
+        
+        # Ensure pixel_values are float32
+        pixel_values = pixel_values.float()
+        
+        # Normalize pixel values to [0, 1] if needed
+        if pixel_values.max() > 1.0:
+            pixel_values = pixel_values / 255.0
+        
+        # Try to extract features from VGGT
+        features = self._extract_vggt_features(pixel_values)
+        
+        # Fallback to CNN if VGGT not available or failed
+        if features is None:
+            if self.fallback_encoder is not None:
+                # Process through fallback CNN
+                features = self.fallback_encoder(pixel_values)  # (batch_size, 512, 7, 7)
+                features = features.view(batch_size, -1)  # (batch_size, 512*7*7)
+                features = self.fallback_projection(features)  # (batch_size, hidden_size)
+            else:
+                # Last resort: create random features (should not happen)
+                features = torch.randn(batch_size, self.hidden_size, device=pixel_values.device)
+        else:
+            # Project VGGT features to desired hidden size
+            # Ensure features are float32 before projection
+            features = features.float()
+            features = self.feature_projection(features)  # (batch_size, hidden_size)
+        
+        # Return in expected format
+        class MockOutput:
+            def __init__(self, last_hidden_state):
+                self.last_hidden_state = last_hidden_state
+                
+        return MockOutput(features.unsqueeze(1))  # (batch_size, 1, hidden_size)
+
 
 class MockVisionEncoder(nn.Module):
-    """Mock vision encoder for testing."""
+    """Mock vision encoder for testing (kept for backward compatibility)."""
     
     def __init__(self, config):
         super().__init__()
@@ -87,8 +492,11 @@ class DistilledLLaVA3D(nn.Module):
         super().__init__()
         self.config = config
         
-        # Vision encoder
-        self.vision_encoder = MockVisionEncoder(config)
+        # Vision encoder - Using VGGT (Visual Geometry Grounded Transformer)
+        # Reference: https://vgg-t.github.io/
+        # Default to CPU for memory, but can be changed after initialization
+        vggt_device = getattr(config, 'vggt_device', 'cpu')
+        self.vision_encoder = VGGTVisionEncoder(config, vggt_device=vggt_device)
         
         # Language model (simplified transformer)
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -125,6 +533,27 @@ class DistilledLLaVA3D(nn.Module):
             nn.Linear(512, 256),
             nn.ReLU(),
             nn.Linear(256, 128)
+        )
+        
+        # New parametric heads used for training and inference features
+        self.detector_classes = [
+            'person','building','sky','water','tree','vehicle','road','indoor','outdoor'
+        ]
+        self.detection_head = nn.Sequential(
+            nn.Linear(config.vision_hidden_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, len(self.detector_classes))  # logits
+        )
+        self.depth_head = nn.Sequential(
+            nn.Linear(config.vision_hidden_size, 128),
+            nn.ReLU(),
+            nn.Linear(128, 3)  # depth bins: foreground/mid/background
+        )
+        # Spatial head predicts left/right and above/below for a single prominent pair proxy
+        self.spatial_head = nn.Sequential(
+            nn.Linear(config.vision_hidden_size, 128),
+            nn.ReLU(),
+            nn.Linear(128, 4)  # [left,right,above,below] logits
         )
         
     def forward(
@@ -305,131 +734,75 @@ class DistilledLLaVA3D(nn.Module):
         return is_artificial_lighting, warm_lighting, lighting_uniformity
     
     def analyze_image_content(self, pixel_values):
-        """Analyze image content with improved indoor/outdoor detection."""
+        """Analyze image content using learnable heads (detection/depth/spatial)."""
         with torch.no_grad():
-            # Get vision features
+            # Get vision features (batch, 1, hidden)
             vision_outputs = self.vision_encoder(pixel_values)
-            vision_features = vision_outputs.last_hidden_state.squeeze(1)  # (batch_size, hidden_size)
+            vision_hidden = vision_outputs.last_hidden_state.squeeze(1)
             
-            # Analyze raw pixel values for better feature detection
-            raw_pixels = pixel_values.squeeze(0)  # (3, 224, 224)
+            # Parametric predictions
+            det_logits = self.detection_head(vision_hidden)  # (batch, C)
+            depth_logits = self.depth_head(vision_hidden)    # (batch, 3)
+            spatial_logits = self.spatial_head(vision_hidden)  # (batch, 4)
             
-            # Calculate basic image statistics
-            mean_rgb = torch.mean(raw_pixels, dim=(1, 2))  # (3,)
-            std_rgb = torch.std(raw_pixels, dim=(1, 2))    # (3,)
+            det_probs = torch.sigmoid(det_logits)[0]
+            depth_probs = torch.softmax(depth_logits, dim=-1)[0]
+            spatial_probs = torch.softmax(spatial_logits, dim=-1)[0]
             
-            # Get max and min values per channel
-            max_rgb = torch.tensor([torch.max(raw_pixels[0]).item(), torch.max(raw_pixels[1]).item(), torch.max(raw_pixels[2]).item()])
-            min_rgb = torch.tensor([torch.min(raw_pixels[0]).item(), torch.min(raw_pixels[1]).item(), torch.min(raw_pixels[2]).item()])
+            # Map outputs to feature dictionary consumed by downstream
+            thr = 0.5
+            has_person = det_probs[self.detector_classes.index('person')].item() > thr
+            has_buildings = det_probs[self.detector_classes.index('building')].item() > thr
+            has_sky = det_probs[self.detector_classes.index('sky')].item() > thr
+            has_tree = det_probs[self.detector_classes.index('tree')].item() > thr
+            has_water = det_probs[self.detector_classes.index('water')].item() > thr
+            has_vehicle = det_probs[self.detector_classes.index('vehicle')].item() > thr if 'vehicle' in self.detector_classes else False
+            is_outdoor = det_probs[self.detector_classes.index('outdoor')].item() > thr
+            is_indoor = det_probs[self.detector_classes.index('indoor')].item() > thr
+            has_natural = has_tree or has_water or has_sky
+            # consider objects detected if any primary category is above threshold
+            has_objects_flag = any([
+                has_person, has_buildings, has_vehicle, has_tree, has_water, has_sky
+            ])
             
-            # Basic image properties
-            brightness = torch.mean(mean_rgb).item()
-            contrast = torch.mean(std_rgb).item()
-            color_variance = torch.var(mean_rgb).item()
+            depth_layers = ['foreground','midground','background']
+            depth_idx = int(torch.argmax(depth_probs).item())
             
-            # IMPROVED INDOOR/OUTDOOR DETECTION
-            # Method 1: Sky detection
-            has_sky, sky_brightness, sky_blue_dominance, sky_contrast = self.detect_sky_region(raw_pixels)
-            
-            # Method 2: Horizon line detection
-            has_horizon, horizon_strength = self.detect_horizon_line(raw_pixels)
-            
-            # Method 3: Natural elements detection
-            has_natural_elements, green_dominance, color_diversity, natural_textures = self.detect_natural_elements(raw_pixels)
-            
-            # Method 4: Artificial lighting detection
-            is_artificial_lighting, warm_lighting, lighting_uniformity = self.detect_artificial_lighting(raw_pixels)
-            
-            # Method 5: Edge and structure analysis
-            edge_detection = torch.std(raw_pixels, dim=0)
-            structure_score = torch.mean(edge_detection).item()
-            
-            # COMBINED INDOOR/OUTDOOR CLASSIFICATION
-            outdoor_score = 0
-            indoor_score = 0
-            
-            # Outdoor indicators
-            if has_sky:
-                outdoor_score += 3
-            if has_horizon:
-                outdoor_score += 2
-            if has_natural_elements:
-                outdoor_score += 2
-            if sky_brightness > 0.5:  # Bright sky
-                outdoor_score += 1
-            if green_dominance > 0.1:  # Vegetation
-                outdoor_score += 1
-            if color_diversity > 0.02:  # Natural color variation
-                outdoor_score += 1
-            
-            # Indoor indicators
-            if is_artificial_lighting:
-                indoor_score += 3
-            if lighting_uniformity > 0.4:  # Very uniform lighting
-                indoor_score += 2
-            if warm_lighting > 0.15:  # Very warm lighting
-                indoor_score += 1
-            if structure_score > 0.3 and not has_sky:  # High structure, no sky
-                indoor_score += 1
-            if contrast < 0.2 and brightness < 0.6:  # Low contrast, dim
-                indoor_score += 1
-            
-            # Final classification with confidence
-            is_outdoor = outdoor_score > indoor_score
-            is_indoor = indoor_score > outdoor_score
-            confidence = abs(outdoor_score - indoor_score) / max(outdoor_score + indoor_score, 1)
-            
-            # Fallback: if neither is clearly dominant, use brightness and contrast
-            if not is_outdoor and not is_indoor:
-                if brightness > 0.6 and contrast > 0.2:
-                    is_outdoor = True
-                elif brightness < 0.4 and contrast < 0.3:
-                    is_indoor = True
-                else:
-                    # Default to outdoor if uncertain (most images are outdoor)
-                    is_outdoor = True
-            
-            # Detect person (improved detection for various clothing and lighting)
-            # More flexible skin tone detection
-            skin_tone_range = (
-                (mean_rgb[0] > 0.3) & (mean_rgb[0] < 0.9) &  # More flexible red range
-                (mean_rgb[1] > 0.25) & (mean_rgb[1] < 0.8) &  # More flexible green range
-                (mean_rgb[2] > 0.15) & (mean_rgb[2] < 0.7)    # More flexible blue range
-            )
-            
-            # Alternative person detection based on human-like proportions and contrast
-            # Look for areas with human-like color patterns (not just skin)
-            # More restrictive for natural scenes
-            human_like_patterns = (
-                (structure_score > 0.1 and contrast > 0.3) or  # High structure AND high contrast
-                (skin_tone_range.item() and structure_score > 0.08)  # Skin tones with some structure
-            )
-            
-            # Build comprehensive features dictionary
             features = {
-                'has_person': skin_tone_range.item() or human_like_patterns,
-                'has_objects': contrast > 0.15,
-                'has_buildings': (structure_score > 0.15 and contrast > 0.3) or (is_outdoor and structure_score > 0.2 and contrast > 0.4),  # More restrictive building detection
+                'has_person': has_person,
+                'has_objects': has_objects_flag,
+                'has_buildings': has_buildings,
                 'has_sky': has_sky,
-                'has_horizon': has_horizon,
-                'has_natural_elements': has_natural_elements,
-                'has_rope': structure_score > 0.3 and contrast > 0.2,  # Rope-like structures
-                'has_cityscape': is_outdoor and structure_score > 0.2,
-                'has_foreground': contrast > 0.2,
-                'has_background': brightness < 0.7,
-                'brightness': brightness,
-                'complexity': contrast,
+                'has_horizon': has_sky,
+                'has_natural_elements': has_natural,
+                'has_rope': False,
+                'has_cityscape': is_outdoor and has_buildings,
+                'has_foreground': True,
+                'has_background': True,
+                'brightness': 0.5,
+                'complexity': 0.5,
                 'is_outdoor': is_outdoor,
                 'is_indoor': is_indoor,
-                'outdoor_confidence': confidence,
-                'outdoor_score': outdoor_score,
-                'indoor_score': indoor_score,
-                'color_variance': color_variance,
-                'structure_score': structure_score,
-                'sky_brightness': sky_brightness,
-                'green_dominance': green_dominance,
-                'warm_lighting': warm_lighting
+                'outdoor_confidence': float(abs(det_probs[self.detector_classes.index('outdoor')].item() - det_probs[self.detector_classes.index('indoor')].item())),
+                'outdoor_score': float(det_probs[self.detector_classes.index('outdoor')].item() * 10.0),
+                'indoor_score': float(det_probs[self.detector_classes.index('indoor')].item() * 10.0),
+                'color_variance': 0.0,
+                'structure_score': 0.0,
+                'sky_brightness': 0.0,
+                'green_dominance': 0.0,
+                'warm_lighting': 0.0,
+                'object_count': int(has_person) + int(has_buildings) + int(has_vehicle) + int(has_tree) + int(has_water) + int(has_sky),
+                'depth_layers': depth_layers,
+                'pred_depth_idx': depth_idx,
+                'detector_probs': {cls: det_probs[i].item() for i, cls in enumerate(self.detector_classes)},
+                'spatial_probs': {
+                    'left': spatial_probs[0].item(),
+                    'right': spatial_probs[1].item(),
+                    'above': spatial_probs[2].item(),
+                    'below': spatial_probs[3].item(),
+                }
             }
+            
             
             return features
     
