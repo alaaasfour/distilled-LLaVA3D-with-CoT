@@ -405,7 +405,7 @@ The real LLaVA-3D teacher:
 
 ## 👤 Author
 
-[Your name and contact information]
+Alaa Asfour (alaa.asfour@torontomu.ca)
 
 ## 🙏 Acknowledgments
 
