@@ -1,3 +1,6 @@
 [submodule "vggt"]
 	path = vggt
 	url = https://github.com/facebookresearch/vggt.git
+[submodule "llava-3d"]
+	path = llava-3d
+	url = git@github.com:ZCMax/LLaVA-3D.git
