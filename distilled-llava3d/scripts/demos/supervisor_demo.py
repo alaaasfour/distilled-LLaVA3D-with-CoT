@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-Comprehensive demo script for supervisor presentation.
 Shows the complete distilled LLaVA-3D project capabilities.
 """
 

@@ -5,9 +5,6 @@ Enhanced Mock Teacher for Real Teacher Distillation
 
 This module creates an enhanced mock teacher that simulates the real LLaVA-3D
 teacher model with more sophisticated responses and 3D understanding capabilities.
-
-Author: Alaa Asfour
-Date: 2024
 """
 
 import os
