@@ -66,7 +66,7 @@ class FixedTrainingPipeline:
         self.batch_size = 1  # Reduced to 1 for VGGT on GPU (can increase if memory allows)
         self.learning_rate = 1e-4
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.validation_split = 0.2  # Use 20% for validation (enabled for publication)
+        self.validation_split = 0.2  # Use 20% for validation
         self.early_stopping_patience = 10  # Stop if validation loss doesn't improve for 10 epochs
         
         # VGGT device: 'cuda' for GPU (faster) or 'cpu' for CPU (slower but more memory)
@@ -753,8 +753,8 @@ class FixedTrainingPipeline:
         return focal_loss.mean()
     
     def train(self):
-        """Main training loop with validation for publication-ready results."""
-        logger.info("🚀 Starting training with validation (publication mode)...")
+        """Main training loop with validation"""
+        logger.info("🚀 Starting training with validation")
         
         start_time = time.time()
         
