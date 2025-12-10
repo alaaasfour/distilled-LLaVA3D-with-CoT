@@ -66,8 +66,8 @@ class FixedTrainingPipeline:
         self.batch_size = 1  # Reduced to 1 for VGGT on GPU (can increase if memory allows)
         self.learning_rate = 1e-4
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.validation_split = 0.0  # No validation split - use all data for training
-        self.early_stopping_patience = None  # Disabled - no early stopping
+        self.validation_split = 0.2  # Use 20% for validation (enabled for publication)
+        self.early_stopping_patience = 10  # Stop if validation loss doesn't improve for 10 epochs
         
         # VGGT device: 'cuda' for GPU (faster) or 'cpu' for CPU (slower but more memory)
         # Default to CPU since GPU is too small (9.75 GB) for VGGT + student + teachers
@@ -753,26 +753,31 @@ class FixedTrainingPipeline:
         return focal_loss.mean()
     
     def train(self):
-        """Main training loop - no validation, train for full 50 epochs like previous successful model."""
-        logger.info("🚀 Starting fixed training (no validation, full 50 epochs)...")
+        """Main training loop with validation for publication-ready results."""
+        logger.info("🚀 Starting training with validation (publication mode)...")
         
         start_time = time.time()
         
         # Initialize models
         self.initialize_models()
         
-        # Load all samples (no validation split when validation_split=0)
+        # Load samples with validation split
         train_samples, val_samples = self.load_expanded_datasets()
         
         if not train_samples:
             logger.error("❌ No training samples found!")
             return
         
-        logger.info(f"📊 Training on {len(train_samples)} samples (no validation split)")
+        logger.info(f"📊 Training on {len(train_samples)} samples")
+        if val_samples:
+            logger.info(f"📊 Validating on {len(val_samples)} samples")
         
-        # Track best training loss
+        # Track best validation loss for model selection
+        best_val_loss = float('inf')
         best_train_loss = float('inf')
         self.training_stats["best_loss"] = float('inf')
+        self.training_stats["best_val_loss"] = float('inf')
+        patience_counter = 0
         
         # Training loop
         for epoch in range(1, self.epochs + 1):
@@ -785,40 +790,73 @@ class FixedTrainingPipeline:
             self.scheduler.step()
             current_lr = self.optimizer.param_groups[0]['lr']
             
-            logger.info(f"   Loss: {train_loss:.6f}, LR: {current_lr:.2e}")
+            # Validate if validation set exists
+            val_loss = None
+            if val_samples:
+                logger.info("   🔍 Running validation...")
+                val_loss = self.validate(val_samples)
+                logger.info(f"   Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, LR: {current_lr:.2e}")
+                
+                # Save best checkpoint based on validation loss (for publication)
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    self.training_stats["best_val_loss"] = val_loss
+                    self.training_stats["best_loss"] = train_loss  # Also track best train loss
+                    patience_counter = 0
+                    self.save_checkpoint(epoch, train_loss, "best", val_loss=val_loss)
+                    logger.info(f"   ✅ New best validation loss: {val_loss:.6f}")
+                else:
+                    patience_counter += 1
+                    logger.info(f"   ⏳ No improvement ({patience_counter}/{self.early_stopping_patience})")
+            else:
+                # No validation set - use training loss
+                logger.info(f"   Loss: {train_loss:.6f}, LR: {current_lr:.2e}")
+                if train_loss < best_train_loss:
+                    best_train_loss = train_loss
+                    self.training_stats["best_loss"] = train_loss
+                    self.save_checkpoint(epoch, train_loss, "best")
+                    logger.info(f"   ✅ New best loss: {train_loss:.6f}")
             
-            # Save best checkpoint based on training loss
-            if train_loss < best_train_loss:
-                best_train_loss = train_loss
-                self.training_stats["best_loss"] = train_loss
-                self.save_checkpoint(epoch, train_loss, "best")
-                logger.info(f"   ✅ New best loss: {train_loss:.6f}")
+            # Early stopping
+            if self.early_stopping_patience and val_samples and patience_counter >= self.early_stopping_patience:
+                logger.info(f"   ⏹️  Early stopping triggered (no improvement for {self.early_stopping_patience} epochs)")
+                self.training_stats["early_stopped"] = True
+                break
             
             # Periodic checkpoint
             if epoch % 10 == 0:
-                self.save_checkpoint(epoch, train_loss, f"epoch_{epoch}")
+                checkpoint_name = f"epoch_{epoch}"
+                if val_loss is not None:
+                    self.save_checkpoint(epoch, train_loss, checkpoint_name, val_loss=val_loss)
+                else:
+                    self.save_checkpoint(epoch, train_loss, checkpoint_name)
         
         training_time = time.time() - start_time
         self.training_stats["training_time"] = training_time
-        self.training_stats["epochs_completed"] = self.epochs
+        self.training_stats["epochs_completed"] = epoch
         
         # Save final results
         self.save_final_results()
         
         logger.info("✅ Training completed!")
-        logger.info(f"   Best Loss: {self.training_stats['best_loss']:.6f}")
+        logger.info(f"   Best Train Loss: {self.training_stats['best_loss']:.6f}")
+        if val_samples:
+            logger.info(f"   Best Val Loss: {self.training_stats['best_val_loss']:.6f}")
         logger.info(f"   Training Time: {training_time:.2f}s")
     
-    def save_checkpoint(self, epoch: int, loss: float, name: str):
+    def save_checkpoint(self, epoch: int, loss: float, name: str, val_loss: float = None):
         """Save model checkpoint."""
         checkpoint_path = self.checkpoint_dir / f"fixed_model_{name}.pt"
-        torch.save({
+        checkpoint_data = {
             'epoch': epoch,
             'model_state_dict': self.student_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'loss': loss,
             'training_stats': self.training_stats
-        }, checkpoint_path)
+        }
+        if val_loss is not None:
+            checkpoint_data['val_loss'] = val_loss
+        torch.save(checkpoint_data, checkpoint_path)
         logger.info(f"💾 Checkpoint saved: {checkpoint_path}")
     
     def save_final_results(self):
