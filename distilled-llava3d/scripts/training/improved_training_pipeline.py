@@ -420,9 +420,69 @@ class ImprovedTrainingPipeline:
                         spatial_loss = 0.5 * (spatial_lr + spatial_ab)
                     
                     # 5. Feature distillation loss
+                    # 5. Feature distillation loss
+                    feature_loss = None
                     if isinstance(teacher_features, dict):
-                        # Simple feature matching (can be enhanced)
-                        feature_loss = torch.tensor(0.0, device=self.device, dtype=torch.float32, requires_grad=True)
+                        feature_losses = []
+                        
+                        # Detector probability alignment
+                        teacher_detector = teacher_features.get('detector_probs')
+                        if isinstance(teacher_detector, dict):
+                            if not hasattr(self, "_detector_class_to_idx"):
+                                self._detector_class_to_idx = {
+                                    cls: idx for idx, cls in enumerate(self.student_model.detector_classes)
+                                }
+                            det_class_to_idx = self._detector_class_to_idx
+                            student_det_probs = torch.sigmoid(det_logits)[0]
+                            student_vals = []
+                            target_vals = []
+                            for cls_name, teacher_prob in teacher_detector.items():
+                                if cls_name not in det_class_to_idx:
+                                    continue
+                                if not isinstance(teacher_prob, (int, float)):
+                                    continue
+                                student_vals.append(student_det_probs[det_class_to_idx[cls_name]])
+                                target_vals.append(float(teacher_prob))
+                            if student_vals:
+                                student_tensor = torch.stack(student_vals)
+                                target_tensor = torch.tensor(target_vals, device=self.device, dtype=torch.float32)
+                                feature_losses.append(F.mse_loss(student_tensor, target_tensor))
+                        
+                        # Spatial distribution alignment
+                        teacher_spatial = teacher_features.get('spatial_probs')
+                        if isinstance(teacher_spatial, dict):
+                            lr_probs = F.softmax(spatial_logits[:, 0:2], dim=-1)[0]
+                            ab_probs = F.softmax(spatial_logits[:, 2:4], dim=-1)[0]
+                            student_spatial_map = {
+                                'left': lr_probs[0],
+                                'right': lr_probs[1],
+                                'above': ab_probs[0],
+                                'below': ab_probs[1],
+                            }
+                            student_vals = []
+                            target_vals = []
+                            for key, teacher_prob in teacher_spatial.items():
+                                if key not in student_spatial_map or not isinstance(teacher_prob, (int, float)):
+                                    continue
+                                student_vals.append(student_spatial_map[key])
+                                target_vals.append(float(teacher_prob))
+                            if student_vals:
+                                student_tensor = torch.stack(student_vals)
+                                target_tensor = torch.tensor(target_vals, device=self.device, dtype=torch.float32)
+                                feature_losses.append(F.mse_loss(student_tensor, target_tensor))
+                        
+                        # Depth classification hint from teacher
+                        teacher_depth_idx = teacher_features.get('pred_depth_idx')
+                        if teacher_depth_idx is None and isinstance(teacher_features.get('depth_layers'), list):
+                            teacher_depth_idx = len(teacher_features['depth_layers']) // 2
+                        if isinstance(teacher_depth_idx, (int, float)):
+                            depth_idx = int(teacher_depth_idx)
+                            if 0 <= depth_idx < depth_logits.shape[-1]:
+                                depth_target = torch.tensor([depth_idx], device=self.device, dtype=torch.long)
+                                feature_losses.append(F.cross_entropy(depth_logits, depth_target))
+                        
+                        if feature_losses:
+                            feature_loss = torch.stack(feature_losses).mean()
                     
                     # Compute uncertainty-weighted total loss
                     total_sample_loss = self.uncertainty_loss(
