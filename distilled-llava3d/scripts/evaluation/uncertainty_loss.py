@@ -8,6 +8,7 @@ Based on: "Multi-Task Learning Using Uncertainty to Weigh Losses" (Kendall et al
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from typing import Dict, Optional
 
 
@@ -101,12 +102,14 @@ class AdaptiveUncertaintyLoss(nn.Module):
         self.min_weight = min_weight
         self.max_weight = max_weight
         
-        # Learnable log-uncertainties
-        self.log_uncertainties = nn.Parameter(torch.zeros(num_tasks))
+        # Learnable log-uncertainties (initialize to small positive values to prevent explosion)
+        # Initialize to log(0.5) so initial precision is 0.5
+        self.log_uncertainties = nn.Parameter(torch.ones(num_tasks) * np.log(2.0))
         
         # Track task difficulties (running averages)
-        self.register_buffer('task_difficulties', torch.ones(num_tasks))
-        self.register_buffer('task_losses_ema', torch.ones(num_tasks))  # Exponential moving average
+        # Initialize to equal difficulty (1/num_tasks)
+        self.register_buffer('task_difficulties', torch.ones(num_tasks) / num_tasks)
+        self.register_buffer('task_losses_ema', torch.ones(num_tasks) * 0.1)  # Initialize to small non-zero value
         
     def forward(self, task_losses: Dict[str, torch.Tensor], 
                 task_names: Optional[list] = None) -> torch.Tensor:
@@ -134,24 +137,35 @@ class AdaptiveUncertaintyLoss(nn.Module):
                 
                 # Update task difficulty estimate (exponential moving average)
                 with torch.no_grad():
-                    self.task_losses_ema[i] = 0.9 * self.task_losses_ema[i] + 0.1 * loss.item()
+                    loss_value = max(loss.item(), 1e-6)  # Prevent zero loss
+                    self.task_losses_ema[i] = 0.9 * self.task_losses_ema[i] + 0.1 * loss_value
                     # Difficulty = normalized loss (relative to other tasks)
-                    if self.task_losses_ema.sum() > 0:
-                        self.task_difficulties[i] = self.task_losses_ema[i] / (self.task_losses_ema.sum() + 1e-8)
+                    # Add small epsilon to prevent division issues
+                    ema_sum = self.task_losses_ema.sum()
+                    if ema_sum > 1e-6:
+                        self.task_difficulties[i] = self.task_losses_ema[i] / (ema_sum + 1e-6)
+                    else:
+                        self.task_difficulties[i] = 1.0 / self.num_tasks  # Equal difficulty
                 
                 # Adaptive uncertainty: higher difficulty = lower uncertainty (higher weight)
                 # But we also learn uncertainty, so combine both
-                difficulty_factor = 1.0 / (self.task_difficulties[i] + 1e-8)
+                # Clamp difficulty to prevent extreme values
+                clamped_difficulty = torch.clamp(self.task_difficulties[i], min=1e-4, max=0.99)
+                difficulty_factor = 1.0 / (clamped_difficulty + 1e-6)
+                
+                # Clamp difficulty_factor to prevent explosion
+                difficulty_factor = torch.clamp(difficulty_factor, min=0.1, max=100.0)
+                
                 learned_precision = torch.exp(-self.log_uncertainties[i])
                 
                 # Combine learned and adaptive weights
                 adaptive_precision = learned_precision * (1.0 - self.adaptation_rate) + \
                                    difficulty_factor * self.adaptation_rate
                 
-                # Clamp precision to valid range
+                # Clamp precision to valid range (more conservative)
                 adaptive_precision = torch.clamp(adaptive_precision, 
                                                 self.min_weight / 2.0, 
-                                                self.max_weight / 2.0)
+                                                min(self.max_weight / 2.0, 50.0))  # Cap at 50
                 
                 # Weighted loss: precision * loss + regularization term
                 weighted_loss = adaptive_precision * loss + self.log_uncertainties[i]
