@@ -298,11 +298,13 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to student model checkpoint')
     parser.add_argument('--image_path', type=str, default=None,
-                       help='Path to single image (or use --data_root for batch)')
+                       help='Path to single image (or use --data_root or --specific_dir for batch)')
     parser.add_argument('--data_root', type=str, default='/home/alasfour/scratch/distilled-llava3d/data',
                        help='Root directory for images (for batch visualization)')
+    parser.add_argument('--specific_dir', type=str, default=None,
+                       help='Specific directory to visualize images from (e.g., data/scannet_real/demo/posed_images/scene0356_00)')
     parser.add_argument('--num_samples', type=int, default=10,
-                       help='Number of samples to visualize (if using data_root)')
+                       help='Number of samples to visualize (if using data_root or specific_dir)')
     parser.add_argument('--output_dir', type=str, default='visualizations',
                        help='Output directory for visualizations')
     parser.add_argument('--question', type=str, default='Describe this 3D scene and identify objects.',
@@ -319,8 +321,19 @@ def main():
     # Get image paths
     if args.image_path:
         image_paths = [args.image_path]
+    elif args.specific_dir:
+        # Load from specific directory
+        specific_path = Path(args.specific_dir)
+        if not specific_path.exists():
+            logger.error(f"❌ Specific directory does not exist: {args.specific_dir}")
+            return
+        
+        logger.info(f"📂 Loading images from specific directory: {args.specific_dir}")
+        image_files = sorted(list(specific_path.glob('*.jpg')) + list(specific_path.glob('*.png')))
+        image_paths = [str(img_file) for img_file in image_files[:args.num_samples]]
+        logger.info(f"✅ Found {len(image_paths)} images in {args.specific_dir}")
     else:
-        # Load from data directory
+        # Load from data directory (default behavior)
         image_paths = []
         data_root = Path(args.data_root)
         for dataset_dir in ['scannet', '3d_front', 'matterport3d']:
