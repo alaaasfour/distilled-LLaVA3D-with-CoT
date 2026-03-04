@@ -1,6 +1,6 @@
-# Distilled LLaVA-3D: Knowledge Distillation for Efficient 3D Vision-Language Understanding
+# Distilled LLaVA-3D: Efficient 3D Vision-Language Models with VGGT and Hidden CoT
 
-A lightweight student model trained via knowledge distillation from the large LLaVA-3D teacher model, featuring VGGT (Visual Geometry Grounded Transformer) as the vision encoder for state-of-the-art 3D scene understanding.
+Knowledge distillation framework for 3D vision-language models (VLMs): transfer 3D spatial understanding from a 7B-parameter teacher (LLaVA-3D) to a compact 2.29B-parameter student with **8.7× inference speedup** and **3× model compression** while retaining **54–72%** of teacher performance on specialized spatial reasoning. Features **VGGT** (Visual Geometry Grounded Transformer) as the vision encoder, **multi-task distillation** with uncertainty-based loss weighting, and **Hidden Chain-of-Thought (Hidden CoT)**—a latent scratchpad for improved reasoning without chain-of-thought data or interface changes.
 
 ## 📋 Table of Contents
 
@@ -16,12 +16,13 @@ A lightweight student model trained via knowledge distillation from the large LL
 
 ## 🎯 Overview
 
-This project implements knowledge distillation to create a smaller, more efficient student model that learns from the large LLaVA-3D-7B teacher model. The student model uses:
+Large 3D VLMs like LLaVA-3D excel at spatial reasoning but are too heavy for edge and real-time use. This project:
 
-- **VGGT (Visual Geometry Grounded Transformer)** as the vision encoder - a state-of-the-art feed-forward network for 3D scene understanding (CVPR 2025 Best Paper Award)
-- **Real LLaVA-3D-7B** as the teacher model for supervision
-- **Multi-task learning** with depth estimation, object detection, and spatial reasoning
-- **CPU offloading** for memory-efficient training
+1. **Distills** LLaVA-3D-7B into a 2.29B student with a custom transformer and **VGGT** vision encoder.
+2. **Trains** with multi-task losses (text, depth, detection, spatial alignment) and **uncertainty-based** adaptive weighting.
+3. **Adds Hidden CoT**: K learnable “thinking” tokens between vision and Q&A; trained and evaluated only on the final answer, with optional **diagnostic mode** to decode the scratchpad for research.
+
+**Outcomes:** 8.7× faster inference, 3× smaller model, 54–72% of teacher performance on spatial tasks (68–72% on proximity/contact). Supports ScanNet and 3D-FRONT.
 
 ### Key Components
 
@@ -32,28 +33,37 @@ This project implements knowledge distillation to create a smaller, more efficie
 
 ## ✨ Features
 
-- **Efficient Architecture**: Reduced from 7B to ~3B parameters while maintaining performance
-- **VGGT Integration**: State-of-the-art 3D vision encoder with pre-trained features
-- **Multi-task Learning**: Simultaneous learning of text generation, depth estimation, object detection, and spatial reasoning
-- **Memory Efficient**: CPU offloading for teacher model and VGGT to fit training on smaller GPUs
-- **Real Teacher Supervision**: Uses actual LLaVA-3D-7B model (not mock) for high-quality supervision
-- **Comprehensive Training**: Supports multiple 3D datasets (ScanNet, 3D-FRONT, Matterport3D)
+- **Efficient architecture**: 2.29B parameters (8.7 GB), 3× compression vs 7B teacher.
+- **VGGT vision encoder**: Geometry-aware 3D features (e.g. camera/depth); ~1B params, full student stays 2.29B.
+- **Multi-task distillation**: Text generation, depth (CE + regression + KL), object detection, spatial corresponding loss, multi-view and feature distillation.
+- **Uncertainty-based loss weighting**: No manual loss weights; task weights adapt during training.
+- **Hidden CoT**: Latent scratchpad (default K=8) for better reasoning; no CoT data or CoT teacher; deployment interface unchanged.
+- **Diagnostic mode**: Optional decoding of thinking tokens to text (`scripts/diagnostic_cot.py`) for interpretability.
+- **Reproducibility**: Cross-platform latency/RAM benchmark, K-ablation runner, training loss and comparison figure scripts.
+- **Memory-friendly training**: CPU offloading for teacher (and optionally VGGT), 2-GPU split (vision vs transformer), gradient checkpointing option.
 
 ## 📦 Requirements
 
 ### System Requirements
 
-- **GPU**: NVIDIA GPU with at least 10GB VRAM (tested on H100 40GB MIG slice)
+- **GPU**: NVIDIA GPU with at least 10GB VRAM (20 GB+ recommended; 2× GPUs for CoT training).
 - **CPU**: 8+ cores recommended
 - **RAM**: 64GB+ recommended
 - **OS**: Linux (tested on Ubuntu 20.04+)
 
 ### Software Requirements
 
-- Python 3.11+
+- Python 3.10+
 - CUDA 11.8+ or 12.1+
 - PyTorch 2.0+
 - SLURM (for cluster environments)
+
+### Main dependencies
+
+- `torch`, `torchvision`
+- `transformers` (Hugging Face)
+- `accelerate`, `einops`, `pillow`, `numpy`, `scipy`, `scikit-learn`, `tqdm`, `pyyaml`
+- Optional: `ultralytics` (YOLO), `bitsandbytes` (8-bit optimizer)
 
 ## 🔧 Installation
 
@@ -193,96 +203,136 @@ python test_vggt_integration.py
 python -c "from real_llava3d_teacher import RealLLaVA3DTeacher; teacher = RealLLaVA3DTeacher(device='cpu'); print('✅ Teacher model loaded successfully')"
 ```
 
+## 📊 Data Preparation
+
+### Layout
+
+Training expects a `data/` directory under the project root with one or more of:
+
+```
+data/
+├── scannet/           # or scannet_real
+│   └── <scene_id>/    # e.g. scene0000_00
+│       ├── *.jpg      # and/or *.png, *.jpeg
+│       └── images/    # optional subfolder
+├── 3d_front/          # or 3d_front_real
+│   └── <scene_id>/
+│       └── *.jpg
+```
+- Each **scene** is a directory.
+- **Images**: `.jpg`, `.png`, or `.jpeg` directly in the scene dir or in `images/`.
+- No strict naming; the loader discovers scenes and samples up to 30 scenes per dataset (50 for `*_real`) and up to 10 images per scene.
+
+### Datasets
+
+- **ScanNet:** [ScanNet](https://github.com/ScanNet/ScanNet) — request access, then place extracted scenes under `data/scannet/`
+- **3D-FRONT:** [3D-FRONT](https://tianchi.aliyun.com/specials/promotion/alibaba-3d-scene-dataset) — extract to `data/3d_front/`
+
 ## 🚀 Training
+### Hidden CoT training (recommended)
 
-### Quick Start
-
-#### Local Training (Single GPU)
+Train the student with Hidden CoT (K=8 by default; answer-only loss):
 
 ```bash
-# Activate environment
 source distilled-llava3d-env/bin/activate
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Load CUDA module (if on cluster)
-module load cuda
+# Local
+python train_cot.py --data_root data --checkpoint_dir checkpoints
 
-# Run training
-python fixed_training_pipeline.py
+# With options
+python train_cot.py --data_root data --checkpoint_dir checkpoints \
+  --num_thinking_tokens 8 --max_epochs 50
 ```
 
-### Training Configuration
+**Cluster (SLURM):**
 
-Key training parameters in `fixed_training_pipeline.py`:
-
-```python
-# Training settings
-epochs = 50
-batch_size = 1  # Reduced for memory efficiency
-learning_rate = 1e-4
-device = "cuda"
-
-# VGGT device (CPU offloading for memory efficiency)
-vggt_device = 'cpu'  # or 'cuda' if GPU memory allows
-
-# Loss weights
-lambda_det = 0.35          # Object detection
-lambda_depth_ce = 0.25     # Depth classification
-lambda_depth_reg = 0.15    # Depth regression
-lambda_depth_kl = 0.0125   # Depth KL divergence
-lambda_spatial = 0.25      # Spatial reasoning
-lambda_mv = 0.1           # Multi-view consistency
-lambda_feat = 0.3         # Feature distillation
+```bash
+# Edit scripts/training/run_cot_train.sbatch: set account, paths, and optionally data_root/checkpoint_dir via env or script.
+sbatch scripts/training/run_cot_train.sbatch
 ```
 
-### Training Process
+Checkpoints: `checkpoints/cot_model_best.pt`, `checkpoints/cot_model_epoch_*.pt`. Results summary: `checkpoints/cot_training_results.json`.
 
-The training pipeline:
+### Ablation over number of thinking tokens (K)
 
-1. **Initialization**:
-   - Loads student model with VGGT vision encoder
-   - Loads real LLaVA-3D teacher model (on CPU for memory efficiency)
-   - Loads depth teacher (DPT-Large) and object detection (YOLO)
-   - Prepares training datasets
+```bash
+# Train each K in {2,4,8,16} for 3 epochs (quick sweep)
+python scripts/training/run_cot_ablation_k.py --k 2 4 8 16 --max_epochs 3 --base_dir checkpoints/cot_ablation_k
 
-2. **Training Loop**:
-   - For each batch:
-     - Extract visual features using VGGT
-     - Generate teacher responses (on CPU)
-     - Compute multi-task losses (text, depth, detection, spatial)
-     - Backpropagate and update student model
+# Collect results only (after some runs)
+python scripts/training/run_cot_ablation_k.py --collect_only --base_dir checkpoints/cot_ablation_k
+```
 
-3. **Checkpointing**:
-   - Saves checkpoints to `checkpoints/` directory
-   - Logs training statistics
+### Other training scripts
+
+- `fixed_training_pipeline.py`, `improved_training_pipeline.py`: Baseline (non-CoT) distillation.
+- `scripts/training/run_train.sbatch`, `run_train_with_validation.sbatch`: SLURM for non-CoT runs.
+
+Training depends on **real LLaVA-3D teacher** (`real_llava3d_teacher`). If that module is not available, CoT training will fail at import; ensure the teacher is set up as in your environment (e.g. LLaVA-3D repo or a custom wrapper).
+
+
+## Evaluation and figures
+
+### Diagnostic mode (decode thinking tokens)
+
+```bash
+python scripts/diagnostic_cot.py --checkpoint checkpoints/cot_model_best.pt \
+  --image data/3d_front_real/bedroom_000/view_000.jpg \
+  --question "Describe this 3D scene and identify objects."
+```
+
+### Cross-platform latency / RAM
+
+```bash
+python scripts/benchmark_cross_platform.py --checkpoint checkpoints/cot_model_best.pt \
+  --warmup 3 --iters 20 --output results/cross_platform_results.csv
+```
+
+### Paper figures
+
+- **Hidden CoT vs diagnostic comparison:**  
+  `python scripts/generate_hidden_cot_comparison_figure.py --image data/3d_front_real/.../view_000.jpg --output results/figures/hidden_cot_comparison.png`
+- **Training loss convergence:**  
+  `python scripts/generate_training_loss_chart.py --output results/figures/training_loss_convergence.png`  
+  (Edit script to point at your training log or use built-in example data.)
 
 ## 📁 Project Structure
 
 ```
 distilled-llava3d/
-├── README.md                          # This file
-├── fixed_training_pipeline.py         # Main training script
-├── real_llava3d_teacher.py            # Teacher model wrapper
-├── real_depth_teacher.py              # Depth teacher (DPT)
-├── object_detection_integration.py    # Object detection (YOLO)
-├── spatial_reasoning_augmentation.py  # Spatial reasoning
-├── install_vggt.sh                    # VGGT installation script
+├── README.md
+│
+├── train_cot.py                     # Hidden CoT training entry
+├── real_llava3d_teacher.py          # LLaVA-3D teacher wrapper
+├── real_depth_teacher.py            # Depth teacher (DPT)
+├── object_detection_integration.py  # Detection (YOLO)
+├── install_vggt.sh                  # VGGT install helper
 │
 ├── scripts/
 │   ├── distillation/
-│   │   ├── student_model.py           # Student model with VGGT
-│   │   ├── distillation_loss.py       # Multi-task loss functions
-│   │   └── dataset_loader.py          # Data loading utilities
-│   │
+│   │   ├── student_model.py         # Student + VGGT + Hidden CoT
+│   │   ├── uncertainty_loss.py     # Uncertainty-based loss
+│   │   ├── dataset_loader.py
+│   │   └── ...
 │   ├── training/
-│   │   └── run_train.sbatch          # SLURM training script
-│   │
-│   └── evaluation/
-│       └── evaluate_3d_tasks.py      # Evaluation scripts
+│   │   ├── run_cot_train.sbatch     # SLURM CoT job
+│   │   ├── run_cot_ablation_k.py     # K ablation runner
+│   │   ├── run_train.sbatch
+│   │   └── logs/
+│   ├── evaluation/
+│   │   └── spatial_benchmark_eval.py
+│   ├── ablation/
+│   ├── diagnostic_cot.py            # Decode thinking tokens
+│   ├── benchmark_cross_platform.py  # Latency/RAM benchmark
+│   ├── generate_hidden_cot_comparison_figure.py
+│   └── generate_training_loss_chart.py
 │
-├── data/                              # Training datasets
-├── checkpoints/                        # Model checkpoints
-├── logs/                              # Training logs
-└── configs/                           # Configuration files
+├── data/                            # Datasets (see Data Preparation)
+├── checkpoints/                     # Saved models
+├── results/
+│   └── figures/                    # Generated figures
+└── configs/
 ```
 
 ## 🔍 Key Implementation Details
@@ -383,10 +433,10 @@ The real LLaVA-3D teacher:
 
 ```bibtex
 @misc{distilled-llava3d,
-  title={Distilled LLaVA-3D: Knowledge Distillation for Efficient 3D Vision-Language Understanding},
-  author={Your Name},
-  year={2025},
-  url={https://github.com/yourusername/distilled-llava3d}
+  title={Distilling 3D Spatial Reasoning into a Lightweight Vision-Language Model with CoT},
+  author={Alaa Asfour},
+  year={2026},
+  url={https://github.com/alaaasfour/distilled-LLaVA3D-with-CoT}
 }
 ```
 
@@ -396,6 +446,7 @@ The real LLaVA-3D teacher:
 - **VGGT**: [VGGT Project Page](https://vgg-t.github.io/)
 - **DPT**: [Intel DPT](https://github.com/isl-org/DPT)
 - **YOLO**: [Ultralytics YOLO](https://github.com/ultralytics/ultralytics)
+- **ScanNet, 3D-FRONT:** See Data Preparation links above.
 
 ## 📝 License
 
@@ -413,5 +464,6 @@ Alaa Asfour (alaa.asfour@torontomu.ca)
 - VGGT team for the vision encoder
 - All open-source contributors
 - Digital Research Alliance of Canada
+- Contributors to ScanNet, 3D-FRONT
 
 ---
