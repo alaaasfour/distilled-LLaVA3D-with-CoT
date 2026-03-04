@@ -225,8 +225,8 @@ data/
 
 ### Datasets
 
-- **ScanNet:** [ScanNet](https://github.com/ScanNet/ScanNet) — request access, then place extracted scenes under `data/scannet/`
-- **3D-FRONT:** [3D-FRONT](https://tianchi.aliyun.com/specials/promotion/alibaba-3d-scene-dataset) — extract to `data/3d_front/`
+- **ScanNet:** [ScanNet](https://github.com/ScanNet/ScanNet) - place extracted scenes under `data/scannet/`
+- **3D-FRONT:** [3D-FRONT](https://huggingface.co/datasets/huanngzh/3D-Front) - extract to `data/3d_front/`
 
 ## 🚀 Training
 ### Hidden CoT training (recommended)
