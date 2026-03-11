@@ -4,7 +4,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 import math
 import warnings
 import os
@@ -78,6 +78,10 @@ class DistilledLLaVA3DConfig:
         
         # VGGT device config (can be 'cpu' or 'cuda')
         self.vggt_device = 'cpu'  # Default to CPU, can be changed
+
+        # Hidden CoT (scratchpad) config
+        self.num_thinking_tokens = 8
+        self.gradient_checkpointing = False
 
 class VGGTVisionEncoder(nn.Module):
     """
@@ -555,6 +559,15 @@ class DistilledLLaVA3D(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 4)  # [left,right,above,below] logits
         )
+
+        # Hidden CoT: project vision+depth to hidden_size and learnable thinking tokens
+        self.vision_depth_projection = nn.Linear(
+            config.vision_hidden_size + config.depth_hidden_size,
+            config.hidden_size
+        )
+        K = getattr(config, 'num_thinking_tokens', 8)
+        self.num_thinking_tokens = K
+        self.thinking_embeddings = nn.Parameter(torch.randn(1, K, config.hidden_size) * 0.02)
         
     def forward(
         self,
@@ -562,69 +575,127 @@ class DistilledLLaVA3D(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         depth_values: Optional[torch.Tensor] = None,
+        answer_start_index: Optional[int] = None,
+        vision_features_precomputed: Optional[torch.Tensor] = None,
         **kwargs
     ) -> torch.Tensor:
-        """Forward pass."""
-        
+        """Forward pass. Supports CoT: vision_features_precomputed + answer_start_index -> loss on answer only."""
         batch_size, seq_len = input_ids.shape
-        
-        # Process vision inputs
+        K = self.num_thinking_tokens
+
+        # CoT path: [V][T1..TK][Q][A] with loss only on A
+        use_cot = (answer_start_index is not None and
+                   (vision_features_precomputed is not None or pixel_values is not None))
+        if use_cot:
+            # Vision: precomputed or from encoder
+            if vision_features_precomputed is not None:
+                vision_features = vision_features_precomputed.to(input_ids.device)
+            else:
+                vision_outputs = self.vision_encoder(pixel_values)
+                vision_features = vision_outputs.last_hidden_state.to(input_ids.device)
+            depth_features = torch.zeros(batch_size, 1, self.config.depth_hidden_size, device=input_ids.device)
+            combined = torch.cat([vision_features, depth_features], dim=-1)
+            vision_proj = self.vision_depth_projection(combined)
+            thinking = self.thinking_embeddings.expand(batch_size, -1, -1)
+            text_emb = self.embedding(input_ids)
+            L = 1 + K + seq_len
+            positions = torch.arange(L, device=input_ids.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+            pos_emb = self.position_embedding(positions)
+            combined_input = torch.cat([vision_proj, thinking, text_emb], dim=1) + pos_emb
+            src_mask = torch.triu(torch.ones(L, L, device=input_ids.device), diagonal=1).bool()
+            outputs = self.transformer(combined_input, mask=src_mask)
+            outputs = self.layer_norm(outputs)
+            logits = self.lm_head(outputs)
+            loss = None
+            if 0 <= answer_start_index < seq_len:
+                start = 1 + K + answer_start_index - 1
+                end = 1 + K + seq_len - 1
+                if start < end:
+                    logits_a = logits[:, start:end, :].reshape(-1, self.config.vocab_size)
+                    labels_a = input_ids[:, answer_start_index:].reshape(-1).clamp(min=0)
+                    loss = F.cross_entropy(logits_a, labels_a, ignore_index=-100, label_smoothing=0.01)
+            text_logits = logits[:, 1 + K - 1 : 1 + K + seq_len, :]
+            return_thinking_logits = kwargs.get("return_thinking_logits", False)
+            thinking_logits = logits[:, 1 : 1 + K, :] if return_thinking_logits else None
+            class MockOutput:
+                def __init__(self, logits, loss=None, thinking_logits=None):
+                    self.logits = logits
+                    self.loss = loss
+                    self.thinking_logits = thinking_logits
+            return MockOutput(text_logits, loss=loss, thinking_logits=thinking_logits)
+
+        # Legacy path
         if pixel_values is not None:
             vision_outputs = self.vision_encoder(pixel_values)
-            vision_features = vision_outputs.last_hidden_state  # (batch_size, 1, hidden_size)
+            vision_features = vision_outputs.last_hidden_state
         else:
-            vision_features = torch.zeros(batch_size, 1, self.config.hidden_size, device=input_ids.device)
-        
-        # Process depth inputs (simplified)
+            vision_features = torch.zeros(batch_size, 1, self.config.vision_hidden_size, device=input_ids.device)
         if depth_values is not None:
-            # Simple depth processing
             depth_features = torch.randn(batch_size, 1, self.config.depth_hidden_size, device=input_ids.device)
         else:
             depth_features = torch.zeros(batch_size, 1, self.config.depth_hidden_size, device=input_ids.device)
-        
-        # Combine vision and depth features
         combined_features = torch.cat([vision_features, depth_features], dim=-1)
-        # Project to hidden size
-        combined_features = nn.Linear(combined_features.size(-1), self.config.hidden_size).to(combined_features.device)(combined_features)
-        
-        # Process text inputs
-        text_embeddings = self.embedding(input_ids)  # (batch_size, seq_len, hidden_size)
-        
-        # Add position embeddings
+        combined_features = self.vision_depth_projection(combined_features)
+        text_embeddings = self.embedding(input_ids)
         positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
         position_embeddings = self.position_embedding(positions)
         text_embeddings = text_embeddings + position_embeddings
-        
-        # Combine text and vision features
-        # Insert vision features at the beginning
-        combined_input = torch.cat([combined_features, text_embeddings], dim=1)  # (batch_size, 1+seq_len, hidden_size)
-        
-        # Create attention mask for combined input
+        combined_input = torch.cat([combined_features, text_embeddings], dim=1)
         if attention_mask is not None:
             vision_mask = torch.ones(batch_size, 1, device=input_ids.device)
             combined_attention_mask = torch.cat([vision_mask, attention_mask], dim=1)
         else:
             combined_attention_mask = torch.ones(batch_size, 1 + seq_len, device=input_ids.device)
-        
-        # Apply transformer
         outputs = self.transformer(combined_input, src_key_padding_mask=~combined_attention_mask.bool())
-        
-        # Apply layer norm
         outputs = self.layer_norm(outputs)
-        
-        # Get logits for language modeling
         logits = self.lm_head(outputs)
-        
-        # Return only the text part of the logits
-        text_logits = logits[:, 1:, :]  # Remove vision part, keep only text
-        
-        # Return in expected format
+        text_logits = logits[:, 1:, :]
         class MockOutput:
-            def __init__(self, logits):
+            def __init__(self, logits, loss=None):
                 self.logits = logits
-                
+                self.loss = loss
         return MockOutput(text_logits)
-    
+
+    def decode_thinking_tokens(
+        self,
+        input_ids: torch.Tensor,
+        answer_start_index: int,
+        tokenizer,
+        vision_features_precomputed: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        skip_special_tokens: bool = True,
+    ) -> List[str]:
+        """
+        Diagnostic mode: decode hidden thinking token positions into human-readable text.
+        Runs a forward pass with return_thinking_logits=True and decodes each of the K
+        positions with the LM head (argmax) to verify whether the model is reasoning
+        spatially or exploiting biases. Use only in development/debug; not for deployment.
+        """
+        self.eval()
+        with torch.no_grad():
+            out = self.forward(
+                input_ids,
+                answer_start_index=answer_start_index,
+                vision_features_precomputed=vision_features_precomputed,
+                pixel_values=pixel_values,
+                return_thinking_logits=True,
+            )
+        if getattr(out, "thinking_logits", None) is None:
+            return []
+        thinking_logits = out.thinking_logits
+        batch_size, K, vocab_size = thinking_logits.shape
+        token_ids = thinking_logits.argmax(dim=-1)
+        result = []
+        for b in range(batch_size):
+            for k in range(K):
+                tid = token_ids[b, k].item()
+                try:
+                    text = tokenizer.decode([tid], skip_special_tokens=skip_special_tokens)
+                except Exception:
+                    text = tokenizer.decode([tid])
+                result.append(text)
+        return result
+
     def detect_sky_region(self, raw_pixels):
         """Detect sky region in the image with improved algorithm."""
         h, w = raw_pixels.shape[1], raw_pixels.shape[2]
